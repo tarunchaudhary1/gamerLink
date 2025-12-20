@@ -1,52 +1,52 @@
-//@ts-nocheck
+// @ts-nocheck
 "use server";
 
 import {
   IngressAudioEncodingPreset,
-  IngressInput,
   IngressClient,
-  IngressVideoEncodingOptions,
-  RoomServiceClient,
+  IngressInput,
+  IngressVideoEncodingPreset,
   TrackSource,
   type CreateIngressOptions,
-  IngressVideoEncodingPreset,
 } from "livekit-server-sdk";
+
 import prisma from "@/db";
 import { getSelf } from "./auth-service";
 import { revalidatePath } from "next/cache";
 
-const roomService = new RoomServiceClient(
+const ingressClient = new IngressClient(
   process.env.LIVEKIT_API_URL!,
   process.env.LIVEKIT_API_KEY!,
   process.env.LIVEKIT_API_SECRET!
 );
 
-const ingressClient = new IngressClient(process.env.LIVEKIT_API_URL!);
 
-export const resetIngresses = async (hostIndentity: string) => {
-  const ingresses = await ingressClient.listIngress({
-    roomName: hostIndentity,
-  });
+const deleteExistingIngress = async (ingressId?: string | null) => {
+  if (!ingressId) return;
 
-  const rooms = await roomService.listRooms([hostIndentity]);
-  for (const room of rooms) {
-    await roomService.deleteRoom(room.name);
-  }
-  for (const ingress of ingresses) {
-    if (ingress.ingressId) {
-      await ingressClient.deleteIngress(ingress.ingressId);
+  try {
+    await ingressClient.deleteIngress(ingressId);
+  } catch (err: any) {
+    if (err?.status !== 404) {
+      throw err;
     }
   }
 };
 
 export const createIngress = async (ingressType: IngressInput) => {
   const self = await getSelf();
-  await resetIngresses(self.id);
+
+  const stream = await prisma.stream.findUnique({
+    where: { userId: self.id },
+  });
+
+  await deleteExistingIngress(stream?.ingressId);
+
   const options: CreateIngressOptions = {
     name: self.username,
-    roomName: self?.id,
-    participantname: self.username,
-    participantIdentity: self?.id,
+    roomName: self.id,
+    participantIdentity: self.id,
+    participantName: self.username,
   };
 
   if (ingressType === IngressInput.WHIP_INPUT) {
@@ -57,15 +57,26 @@ export const createIngress = async (ingressType: IngressInput) => {
       preset: IngressVideoEncodingPreset.H264_1080P_30FPS_3_LAYERS,
     };
   }
+
   options.audio = {
     source: TrackSource.MICROPHONE,
     preset: IngressAudioEncodingPreset.OPUS_STEREO_96KBPS,
   };
 
-  const ingress = await ingressClient.createIngress(ingressType, options);
-  if (!ingress || !ingress.url || !ingress.streamKey) {
+  let ingress;
+  try {
+    ingress = await ingressClient.createIngress(ingressType, options);
+  } catch (err: any) {
+    if (err?.status === 429) {
+      throw new Error("Too many requests. Please wait a few seconds and try again.");
+    }
+    throw err;
+  }
+
+  if (!ingress?.url || !ingress?.streamKey || !ingress?.ingressId) {
     throw new Error("Failed to create ingress");
   }
+
   await prisma.stream.update({
     where: { userId: self.id },
     data: {
@@ -74,6 +85,6 @@ export const createIngress = async (ingressType: IngressInput) => {
       streamKey: ingress.streamKey,
     },
   });
+
   revalidatePath(`/u/${self.username}/keys`);
-  //   return ingress;
 };
